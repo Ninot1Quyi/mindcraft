@@ -1,5 +1,6 @@
-import { writeFile, readFile, mkdirSync } from 'fs';
+import { writeFile, readFile, rmSync, mkdirSync, copyFileSync, lstatSync, readdirSync, existsSync } from 'fs';
 import settings from '../../settings.js';
+import path from 'path';
 
 export class Coder {
     constructor(agent) {
@@ -10,6 +11,8 @@ export class Coder {
         this.generating = false;
         this.code_template = '';
         this.timedout = false;
+        this.new_func_code = ''; //生成的新代码
+
 
         readFile('./bots/template.js', 'utf8', (err, data) => {
             if (err) throw err;
@@ -17,11 +20,47 @@ export class Coder {
         });
 
         mkdirSync('.' + this.fp, { recursive: true });
+        // Copy the base file, and finally Boolean parameters control whether to replace the existing file.
+        const targetLibraryPath = './bots/' + agent.name + '/library';
+        this.copyFolderRecursiveSync('./src/agent/library', targetLibraryPath,false);
+        // Copy the base file, and finally Boolean parameters control whether to replace the existing file.Replace-true.
+        const targetUtilsPath = './bots/utils';
+        this.copyFolderRecursiveSync('./src/utils', targetUtilsPath,true);
+
+    }
+    // Recursively copies the folder and its contents
+    copyFolderRecursiveSync(source, target, shouldReplace) {
+        // If shouldReplace is true, delete the target folder and its contents
+        if (shouldReplace && existsSync(target)) {
+            console.log('Deleting target folder:', target);
+            rmSync(target, { recursive: true, force: true });
+        }
+
+        // Ensure the target path exists
+        if (!existsSync(target)) {
+            mkdirSync(target, { recursive: true });
+        }
+
+        // Read the contents of the source folder
+        if (lstatSync(source).isDirectory()) {
+            let files = readdirSync(source);
+            files.forEach((file) => {
+                let curSource = path.join(source, file);
+                let curTarget = path.join(target, file);
+                if (lstatSync(curSource).isDirectory()) {
+                    // Recursively copy subfolders
+                    copyFolderRecursiveSync(curSource, curTarget, false);
+                } else {
+                    // Copy the file to the target folder
+                    copyFileSync(curSource, curTarget);
+                }
+            });
+        }
     }
 
     // write custom code to file and import it
     async stageCode(code) {
-        code = this.sanitizeCode(code);
+        code = await this.sanitizeCode(code);
         let src = '';
         code = code.replaceAll('console.log(', 'log(bot,');
         code = code.replaceAll('log("', 'log(bot,"');
@@ -33,6 +72,20 @@ export class Coder {
         for (let line of code.split('\n')) {
             src += `    ${line}\n`;
         }
+
+        //Copy src into the variable new fuc code
+        const regex = /async function[\s\S]*/;
+        let match = src.match(regex);
+        if (match) {
+            // 将匹配结果赋值给 new_func_code
+            match = match[0];
+        } else {
+            console.error("The string 'async function' was not found.");
+        }
+        this.new_func_code = '\nexport '+match.trim();
+        this.new_func_code = this.new_func_code.replace(/skills\./g, '');
+        this.new_func_code = this.new_func_code.substring(0, this.new_func_code.lastIndexOf('\n'));
+
         src = this.code_template.replace('/* CODE HERE */', src);
 
         let filename = this.file_counter + '.js';
@@ -46,7 +99,7 @@ export class Coder {
         this.file_counter++;
 
         let write_result = await this.writeFilePromise('.' + this.fp + filename, src)
-        
+
         if (write_result) {
             console.error('Error writing code execution file: ' + result);
             return null;
@@ -54,18 +107,79 @@ export class Coder {
         return await import('../..' + this.fp + filename);
     }
 
-    sanitizeCode(code) {
-        code = code.trim();
-        const remove_strs = ['Javascript', 'javascript', 'js']
-        for (let r of remove_strs) {
-            if (code.startsWith(r)) {
-                code = code.slice(r.length);
-                return code;
+    async sanitizeCode(code) {
+        for (let i = 0; i < 3; i++) { // MAX try 3 times
+            code = code.trim();
+            const remove_strs = ['Javascript', 'javascript', 'js']
+            for (let r of remove_strs) {
+                if (code.startsWith(r)) {
+                    code = code.slice(r.length);
+                }
+            }
+            //Check and correct comment blocks. Comment blocks should be inside the function and immediately below the function name.
+            //If not, move the comment block to the correct position.
+            //1. Check for the existence of comment blocks, which should be structured as /** ... **/
+            const commentBlockRegex = /\/\*\*[^]*?\*\//;
+            const commentBlockMatch = code.match(commentBlockRegex);
+            const commentBlock = commentBlockMatch ? commentBlockMatch[0] : null;
+            //2.1 if comment block exists, check if it is in the correct position
+            if (commentBlock) {
+                const functionNameRegex = /async\s+function\s+(\w+)\s*\(/;
+                const functionNameMatch = code.match(functionNameRegex);
+                const functionName = functionNameMatch ? functionNameMatch[1] : null;
+                // Check if the comment block is in the correct position
+                if (functionName && code.indexOf(commentBlock) >= 0 && code.indexOf(commentBlock) > code.indexOf(`async function ${functionName}`)) {
+                    console.log('Comment block is in the correct position');
+                } else {
+                    console.log('Comment block exists, but not in the correct position');
+                    // If the comment block is not in the correct position, move it to the correct position
+                    if (functionName) {
+                        code = code.replace(commentBlock, ''); // Remove existing comment block
+                        const functionHeaderEndIndex = code.indexOf('{', code.indexOf(`async function ${functionName}`)) + 1;
+                        code = code.slice(0, functionHeaderEndIndex) + '\n' + commentBlock + code.slice(functionHeaderEndIndex);
+                    }
+                }
+                break
+            } else {
+                console.log('Comment block does not exist, add a comment block to the code...');
+                //2.2 if comment block does not exist, add a comment block to the code
+                let prompt = 'The generated code did not create comment sections according to my requirements. Please fix this issue. Adjust the generated code structure to conform to the following format,for example:\n' +
+                    'async function goToBed(bot) {\n' +
+                    '  /**\n' +
+                    '   * @level basic\n' +
+                    '   * @description Sleep in the nearest bed.\n' +
+                    '   * @param {MinecraftBot} bot, reference to the Minecraft bot.\n' +
+                    '   * @returns {Promise<boolean>} true if the bed was found, false otherwise.\n' +
+                    '   * @example\n' +
+                    '   * await skills.goToBed(bot);\n' +
+                    '   **/\n' +
+                    '  return true;\n' +
+                    '}\n' +
+                    'The code you need to adjust is as follows:\n' +
+                    `${code}`; // The code that needs to be adjusted
+
+                code = await this.agent.prompter.chat_model.sendRequest([], prompt);
+                code = code.substring(code.indexOf('```')+3, code.lastIndexOf('```'));
+
             }
         }
         return code;
     }
+    extractFunctionNameAndComments(code) {
+        // Define regular expressions for extracting function name and comments
+        const functionNameRegex = /export\s+async\s+function\s+(\w+)\s*\(/;
+        const commentBlockRegex = /\/\*\*[^]*?\*\//;
 
+        // Extract the function name
+        const functionNameMatch = code.match(functionNameRegex);
+        const functionName = functionNameMatch ? functionNameMatch[1] : null;
+
+        // Extract the comment block
+        const commentBlockMatch = code.match(commentBlockRegex);
+        const commentBlock = commentBlockMatch ? commentBlockMatch[0] : null;
+
+        return { functionName, commentBlock };
+    }
     writeFilePromise(filename, src) {
         // makes it so we can await this function
         return new Promise((resolve, reject) => {
@@ -92,14 +206,13 @@ export class Coder {
     async generateCodeLoop(agent_history) {
         let messages = agent_history.getHistory();
         messages.push({role: 'system', content: 'Code generation started. Write code in codeblock in your response:'});
-
         let code_return = null;
         let failures = 0;
         const interrupt_return = {success: true, message: null, interrupted: true, timedout: false};
         for (let i=0; i<5; i++) {
             if (this.agent.bot.interrupt_code)
                 return interrupt_return;
-            console.log(messages)
+            // console.log(messages)
             let res = await this.agent.prompter.promptCoding(JSON.parse(JSON.stringify(messages)));
             if (this.agent.bot.interrupt_code)
                 return interrupt_return;
@@ -107,7 +220,7 @@ export class Coder {
             if (!contains_code) {
                 if (res.indexOf('!newAction') !== -1) {
                     messages.push({
-                        role: 'assistant', 
+                        role: 'assistant',
                         content: res.substring(0, res.indexOf('!newAction'))
                     });
                     continue; // using newaction will continue the loop
@@ -117,26 +230,54 @@ export class Coder {
                     agent_history.add('system', code_return.message);
                     agent_history.add(this.agent.name, res);
                     this.agent.bot.chat(res);
+                    //Write the new func code to the file
+                    let targetPath = './bots/' + this.agent.name + '/library/skills.js';
+                    //extract function name and comments
+                    let { functionName, commentBlock } = this.extractFunctionNameAndComments(this.new_func_code);
+                    //Extract all keys for this.agent.prompter.code_docs.embeddings
+                    let existingFunctions = Object.keys(this.agent.prompter.code_docs.embeddings);
+                    //write the new func code to the file
+                    //Check that functionName is included in any element of an existing function
+                    const isContained = existingFunctions.some(existingFunction => existingFunction.includes(functionName));
+                    if (!isContained) {
+                        // If functionName is not in an existing function, append new code
+                        writeFile(targetPath, this.new_func_code, { flag: 'a' }, (err) => {
+                            if (err) {
+                                console.error('Failed to write code to file:', err);
+                                return null;
+                            }
+                            // console.log(`${functionName} Successfully appended new function code to file.`);
+                            // console.log(this.new_func_code)
+                            // console.log(existingFunctions)
+                        });
+                        //update the embadded code
+                        await this.agent.prompter.code_docs.addNewExample(['skills.'+functionName,commentBlock]);
+                    } else {
+                        console.log(`Function ${functionName} already exists. Skipping write.`);
+                    }
                     return {success: true, message: null, interrupted: false, timedout: false};
                 }
                 if (failures >= 1) {
                     return {success: false, message: 'Action failed, agent would not write code.', interrupted: false, timedout: false};
                 }
                 messages.push({
-                    role: 'system', 
+                    role: 'system',
                     content: 'Error: no code provided. Write code in codeblock in your response. ``` // example ```'}
                 );
                 failures++;
                 continue;
             }
             let code = res.substring(res.indexOf('```')+3, res.lastIndexOf('```'));
-
             const execution_file = await this.stageCode(code);
+
+
             if (!execution_file) {
                 agent_history.add('system', 'Failed to stage code, something is wrong.');
                 return {success: false, message: null, interrupted: false, timedout: false};
             }
             code_return = await this.execute(async ()=>{
+                console.log("=====================================================")
+                console.log(execution_file)
                 return await execution_file.main(this.agent.bot);
             }, settings.code_timeout_mins);
 
@@ -199,6 +340,8 @@ export class Coder {
             let timedout = this.timedout;
             this.clear();
             if (!interrupted && !this.generating) this.agent.bot.emit('idle');
+            // console.log('code execution failed|||||||||||||||||||||||||||||||||||||||');
+            // console.log(this.new_func_code_relevent_docs)
             return {success:true, message: output, interrupted, timedout};
         } catch (err) {
             this.executing = false;
@@ -207,7 +350,16 @@ export class Coder {
             console.error("Code execution triggered catch: " + err);
             await this.stop();
 
-            let message = this.formatOutput(this.agent.bot) + '!!Code threw exception!!  Error: ' + err;
+            // console.log(this.new_func_code_relevent_docs)
+            // 使用 err.stack 获取详细错误信息
+            let detailedError = err.toString();//err.stack || err.toString();
+            let errMessage = [{"role": "system", "content": detailedError}];
+            let errReleventDocs = await this.agent.prompter.code_docs.getRelevantSkillDocs(errMessage,2);
+            let message = this.formatOutput(this.agent.bot) +
+                'Fix the code error in the last answer!!Code threw exception!! Error: ' +
+                detailedError + '\n' +
+                '1.Error repair reference, the correct usage is as follows\n' +
+                errReleventDocs ;
             let interrupted = this.agent.bot.interrupt_code;
             this.clear();
             if (!interrupted && !this.generating) this.agent.bot.emit('idle');
